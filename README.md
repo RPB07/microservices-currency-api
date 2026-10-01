@@ -18,8 +18,9 @@ CREATE DATABASE db_currency;
 
 ## Execução
 
-1. Execute `start_consul.bat`, informe a senha local do PostgreSQL e aguarde o
-   script iniciar o Consul e cadastrar as configurações.
+1. Execute `start_consul.bat` para iniciar o Consul e cadastrar as configurações.
+   A senha presente no script é fictícia e pode ser substituída pela senha do
+   ambiente em que os microsserviços forem executados.
 2. Em um terminal, execute `product-api\mvnw.cmd spring-boot:run`.
 3. Em outro terminal, execute `currency-api\mvnw.cmd spring-boot:run`.
 
