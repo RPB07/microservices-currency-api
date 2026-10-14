@@ -1,7 +1,8 @@
 # Microsserviços — Product API e Currency API
 
-Entrega da atividade de criação do `currency-api`, seguindo a estrutura do `product-api`
-desenvolvido em aula.
+Backend de e-commerce com consulta de produtos e cotações, seguindo a estrutura
+desenvolvida em aula. A comunicação entre os serviços implementa fallback, timeout,
+retry, circuit breaker e cache.
 
 ## Pré-requisitos
 
@@ -21,8 +22,22 @@ CREATE DATABASE db_currency;
 1. Execute `start_consul.bat` para iniciar o Consul e cadastrar as configurações.
    A senha presente no script é fictícia e pode ser substituída pela senha do
    ambiente em que os microsserviços forem executados.
-2. Em um terminal, execute `product-api\mvnw.cmd spring-boot:run`.
-3. Em outro terminal, execute `currency-api\mvnw.cmd spring-boot:run`.
+2. Em um terminal, entre em `currency-api` e execute `.\mvnw.cmd spring-boot:run`.
+3. Em outro terminal, entre em `product-api` e execute `.\mvnw.cmd spring-boot:run`.
+
+Os serviços seguem a integração do [commit de referência](https://github.com/luciano-ferretto/ParadLingProg_202602/commit/31fcb043188f8df119ec65ce014ba8ced3912cf8).
+O Consul é obrigatório para configuração e descoberta dos serviços. A Product API usa
+`CurrencyClient`, configurado em `CurrencyClientConfig` com `RestClient` e `@LoadBalanced`,
+para acessar `http://currency-api/currencies` pelo nome registrado no Consul.
+O preço convertido é o preço do produto multiplicado pela taxa; para a mesma moeda,
+o preço original é preservado sem chamada à Currency API.
+
+Exemplos de consulta de produtos:
+
+```text
+GET http://localhost:8000/products/1?targetCurrency=BRL
+GET http://localhost:8000/products?targetCurrency=BRL&page=0&size=10
+```
 
 O Flyway cria e popula as tabelas automaticamente. Para testar a nova API:
 
@@ -40,3 +55,94 @@ Resposta esperada:
   "environment": "Currency API running in Port: 8100"
 }
 ```
+
+## Resiliência
+
+O fluxo de conversão é `ProductServiceJpa → CurrencyClientService → CurrencyClient`.
+O serviço intermediário concentra as anotações de cache e Resilience4j. O fallback
+permanece na conversão do produto, após o esgotamento das tentativas ou a rejeição
+pelo circuito aberto.
+
+| Padrão | Configuração e comportamento |
+| --- | --- |
+| Fallback | Retorna o produto com `convertedPrice = -1` e acrescenta `ERROR` ao `environment` quando a conversão falha. |
+| Timeout | `SimpleClientHttpRequestFactory`: conexão de 1 segundo e leitura de 2 segundos por tentativa. |
+| Retry | Até 3 tentativas, incluindo a inicial, com intervalo de 1 segundo. Ignora `CallNotPermittedException`. |
+| Circuit breaker | Janela de 5 chamadas, mínimo de 5, limite de falhas de 50% e espera de 100 segundos no estado aberto. |
+| Cache | Caffeine, chave `source-target`, até 1.000 entradas e expiração de 10 minutos após a gravação. |
+
+A ordem é **Cache (99) → Retry (100) → Circuit Breaker (101)**. Assim, um acerto
+no cache dispensa os demais interceptadores, inclusive quando o circuito está aberto.
+Cada tentativa do retry conta separadamente na janela do circuit breaker.
+Exceções não são armazenadas no cache; o marcador `-1` é produzido fora dele.
+Para a mesma moeda, o preço original é retornado sem consultar o serviço remoto.
+
+Todas as configurações externas da atividade estão em `start_consul.bat`, nas chaves
+`config/application/` (Actuator compartilhado) e `config/product-api/` (resiliência e cache).
+Execute novamente o script e reinicie os serviços após atualizar essas configurações.
+O marcador `-1` e a exposição ampla do Actuator são usados para o exercício em desenvolvimento.
+
+## Testes automatizados e resultados
+
+Na raiz, execute:
+
+```powershell
+.\product-api\mvnw.cmd -f product-api/pom.xml test
+.\currency-api\mvnw.cmd -f currency-api/pom.xml test
+```
+
+Os testes não exigem PostgreSQL nem Consul em execução. Os testes de resiliência
+carregam os valores do próprio `start_consul.bat` em um contexto Spring com AOP,
+Resilience4j e Caffeine reais; o cliente remoto e o repository são simulados.
+O teste de timeout usa o cliente HTTP de produção contra um servidor HTTP local
+que demora 4 segundos para responder.
+
+Validação realizada: **9 testes aprovados, sem falhas** (7 na Product API e 2 na Currency API).
+As **29 chaves** de `start_consul.bat` também foram gravadas e conferidas via API
+em um Consul temporário na porta 18500, encerrado ao final. Essa verificação
+valida os comandos Key/Value sem alterar o agente usado pelos serviços.
+
+| Cenário verificado | Resultado |
+| --- | --- |
+| Cotação bem-sucedida e cache por par | A consulta repetida reutiliza a resposta, mesmo com circuito aberto; outro par continua protegido pelo circuito. |
+| Duas falhas temporárias e recuperação | Exatamente 3 chamadas; a resposta recuperada é armazenada no cache. |
+| Falhas persistentes | O circuito abre após 5 tentativas falhas; novas consultas não chamam o cliente nem geram novos retries. |
+| Recuperação do circuito | A transição para HALF_OPEN é forçada no teste; chamadas bem-sucedidas fecham o circuito. |
+| Fallback | O produto mantém ID e preço original e retorna conversão `-1`, tanto após retries quanto com circuito aberto. |
+| Mesma moeda e produto inexistente | Não há chamada remota para a mesma moeda; produto inexistente continua gerando erro. |
+| Listagem paginada | Produtos com o mesmo par reutilizam uma única cotação; preço 100 × taxa 5,15 retorna 515. |
+| Timeout HTTP | A leitura da resposta atrasada falha com `SocketTimeoutException`, capturada como `ResourceAccessException`. |
+| Currency API | Consulta existente retorna a taxa e o ambiente; par inexistente lança `EntityNotFoundException`. |
+
+A recuperação automática após os 100 segundos e o funcionamento completo com os
+dois bancos e o registro dos serviços devem ser conferidos no ambiente local;
+os testes automatizados isolam essas dependências.
+
+## Conferência com os serviços em execução
+
+O script habilita os endpoints de monitoramento nos dois serviços. Na Product API,
+consulte `/actuator/health`, `/actuator/caches`, `/actuator/circuitbreakers`,
+`/actuator/circuitbreakerevents` e `/actuator/retryevents`.
+
+1. Com ambos os serviços ativos, consulte `/products/1?targetCurrency=BRL`.
+   A cotação inicial USD/BRL é 5,15. Repita a consulta para preencher e reutilizar o cache.
+2. Interrompa a Currency API. A mesma consulta ainda usa a cotação já armazenada.
+3. Limpe o cache para testar falhas sem aguardar os 10 minutos:
+
+   ```powershell
+   Invoke-RestMethod -Method Delete -Uri 'http://localhost:8000/actuator/caches/currency-api'
+   ```
+
+4. Consulte novamente o produto. Deve retornar HTTP 200, `convertedPrice = -1`
+   e `ERROR` no ambiente. Repita até abrir o circuito; as tentativas registradas
+   podem ser observadas pelos endpoints de eventos. Com falhas consecutivas,
+   a primeira consulta faz 3 tentativas e a segunda completa as 5 falhas da janela.
+5. Com o circuito aberto, novas consultas sem cache devem retornar o fallback
+   sem novas chamadas remotas. Reinicie a Currency API, aguarde os 100 segundos
+   e faça novas consultas para acompanhar HALF_OPEN e CLOSED. Acertos no cache
+   não contam como chamadas de recuperação; limpe-o entre essas consultas.
+
+O teste automatizado de timeout oferece uma simulação de lentidão reproduzível:
+execute a Product API com `-Dtest=CurrencyClientConfigTest test` pelo Maven.
+O teste `CurrencyResilienceIntegrationTest` demonstra falhas temporárias, retries,
+fallback, abertura do circuito, recuperação e cache em conjunto.
