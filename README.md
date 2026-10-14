@@ -1,8 +1,9 @@
 # Microsserviços — Product API e Currency API
 
 Backend de e-commerce com consulta de produtos e cotações, seguindo a estrutura
-desenvolvida em aula. A comunicação entre os serviços implementa fallback, timeout,
-retry, circuit breaker e cache.
+desenvolvida em aula. A Currency API consulta a PTAX do Banco Central do Brasil
+e usa o PostgreSQL como fallback. As duas comunicações HTTP implementam
+fallback, timeout, retry, circuit breaker e cache.
 
 ## Pré-requisitos
 
@@ -39,24 +40,86 @@ GET http://localhost:8000/products/1?targetCurrency=BRL
 GET http://localhost:8000/products?targetCurrency=BRL&page=0&size=10
 ```
 
-O Flyway cria e popula as tabelas automaticamente. Para testar a nova API:
+O Flyway cria e popula as tabelas locais de fallback automaticamente. Para consultar uma cotação:
 
 ```text
 GET http://localhost:8100/currencies?source=USD&target=BRL
 ```
 
-Resposta esperada:
+Com o BCB disponível, a data fixa configurada é **04/10/2024** (formato da API:
+`MM-dd-yyyy`, portanto `10-04-2024`). A resposta esperada para USD/BRL é:
 
 ```json
 {
   "sourceCurrency": "USD",
   "targetCurrency": "BRL",
-  "conversionRate": 5.15,
-  "environment": "Currency API running in Port: 8100"
+  "conversionRate": 5.4686,
+  "environment": "Currency API running in Port: 8100 - BCB (10-04-2024)"
 }
 ```
 
-## Resiliência
+## Currency API → Banco Central
+
+O fluxo é `CurrencyServiceJpa → BcbClientService → BcbClient`. O cliente declarativo
+usa `@HttpExchange`, `@GetExchange` e `RestClient`, configurado em `BcbClientConfig`.
+Ele consulta o endpoint exigido no enunciado:
+
+```text
+https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoMoedaDia(moeda=@moeda,dataCotacao=@dataCotacao)?@moeda='{MOEDA}'&@dataCotacao='{DATA}'&$format=json
+```
+
+Os DTOs interpretam a lista `value` e a cotação de venda. Entre os registros
+válidos, é selecionado o boletim de data/hora mais recente. Valores ausentes,
+nulos, zero, negativos e não finitos são rejeitados antes de entrar no cache.
+
+A [documentação de dados do BCB](https://www.bcb.gov.br/conteudo/dadosabertos/BCBDepin/gnastportal-dados-abertostaxas-de-cambio---todos-os-boletins-diarios.pdf)
+define a cotação de venda em reais por unidade da moeda consultada. Para preservar
+os pares consumidos pela Product API, o cálculo é `cotacaoBRL(origem) / cotacaoBRL(destino)`.
+A cotação de BRL em BRL vale 1 e dispensa consulta externa. Assim, USD/BRL usa
+a cotação de USD, BRL/USD usa seu inverso e USD/EUR divide as duas cotações.
+
+| Padrão | Configuração |
+| --- | --- |
+| Fallback | Falha externa, ausência de dados ou circuito aberto levam à consulta do par no banco local. Sem cotação válida nas duas fontes, retorna HTTP 404. |
+| Timeout | Conexão de 2 segundos e leitura de 5 segundos, por tentativa. |
+| Retry | Até 3 tentativas, incluindo a inicial, com intervalo de 1 segundo; ignora `CallNotPermittedException`. |
+| Circuit breaker | `COUNT_BASED`, janela e mínimo de 5 chamadas, limite de falhas de 50% e intervalo aberto de 100 segundos. |
+| Cache | Caffeine, `bcb-api`, chave `moeda-data`, limite de 1.000 entradas e expiração de 10 minutos após a gravação. |
+
+A ordem segue a atividade anterior: **Cache (99) → Retry (100) → Circuit Breaker (101)**.
+O cache do BCB armazena apenas taxas externas válidas. Respostas vazias e falhas
+lançam exceção; o fallback local acontece fora desse método e não é gravado nesse cache.
+Uma resposta vazia também passa pelas tentativas e pela contabilização de falhas.
+
+O endpoint `/currencies?source=...&target=...` mantém os quatro campos existentes.
+O `environment` indica `BCB (data)` ou `LOCAL FALLBACK`. Por exemplo, se o BCB
+falhar, o par USD/BRL cadastrado na migração retorna 5,15 em vez de 5,4686.
+Os avisos de fallback são registrados nos logs.
+
+As configurações estão em `config/currency-api/` no `start_consul.bat`:
+`bcb.base-url`, `bcb.quote-date`, instância de resiliência `bcb-api` e cache `bcb-api`.
+Ao alterá-las, reinicie a Currency API. A data fixa é didática e representa uma
+cotação histórica; não há busca automática por dias úteis ou pela cotação atual.
+
+Para observar as chamadas ao BCB, consulte os endpoints da **Currency API**:
+`/actuator/circuitbreakerevents/bcb-api`, `/actuator/retryevents/bcb-api`,
+`/actuator/circuitbreakers` e `/actuator/caches`.
+
+O cache da Product API pode responder antes de chegar à Currency API. Para testar
+uma nova consulta externa, limpe os dois caches:
+
+```powershell
+Invoke-RestMethod -Method Delete -Uri 'http://localhost:8000/actuator/caches/currency-api'
+Invoke-RestMethod -Method Delete -Uri 'http://localhost:8100/actuator/caches/bcb-api'
+```
+
+Os timeouts da Product API continuam sendo os da aula anterior (conexão de 1 segundo
+e leitura de 2 segundos). Em uma demora prolongada no BCB, a Product API pode
+atingir seu próprio limite e retornar `convertedPrice = -1` antes da conclusão
+do fallback local da Currency API. Os testes de timeout externo consultam a
+Currency API ou o cliente BCB diretamente para verificar o limite de 5 segundos.
+
+## Resiliência Product API → Currency API
 
 O fluxo de conversão é `ProductServiceJpa → CurrencyClientService → CurrencyClient`.
 O serviço intermediário concentra as anotações de cache e Resilience4j. O fallback
@@ -84,7 +147,7 @@ O marcador `-1` e a exposição ampla do Actuator são usados para o exercício 
 
 ## Aderência ao enunciado e à base da aula
 
-Os 19 comandos Key/Value exigidos no enunciado foram comparados com o script:
+Os 19 comandos Key/Value exigidos na atividade anterior foram comparados com o script:
 todos estão presentes, com os mesmos nomes e valores. Foram preservados a
 estrutura de pacotes, o cliente HTTP declarativo, o `RestClient` com `@LoadBalanced`
 e o fluxo de conversão do commit de referência.
@@ -119,10 +182,38 @@ Resilience4j e Caffeine reais; o cliente remoto e o repository são simulados.
 O teste de timeout usa o cliente HTTP de produção contra um servidor HTTP local
 que demora 4 segundos para responder.
 
-Validação realizada: **10 testes aprovados, sem falhas** (7 na Product API e 3 na Currency API).
-As **29 chaves** de `start_consul.bat` também foram gravadas e conferidas via API
-em um Consul temporário na porta 18500, encerrado ao final. Essa verificação
-valida os comandos Key/Value sem alterar o agente usado pelos serviços.
+Validação atual: **22 testes aprovados, sem falhas** (7 na Product API e 15 na Currency API).
+O script possui 44 chaves, incluindo 15 novas configurações da integração BCB.
+Os testes de integração Spring carregam as configurações do próprio script.
+
+| Cenário exigido na atividade BCB | Verificação |
+| --- | --- |
+| 1. Moeda com cotação | JSON OData válido é interpretado; o boletim mais recente é escolhido e o BCB tem preferência sobre o banco. |
+| 2. Sem cotação externa | Lista `value` vazia aciona fallback local; a ausência não entra no cache e uma consulta posterior pode recuperar a taxa externa. |
+| 3. Falha de comunicação | Duas falhas temporárias são seguidas de sucesso na terceira tentativa; o resultado recuperado é armazenado. |
+| 4. Lentidão | Servidor HTTP local atrasa 8 segundos; o cliente de produção lança `SocketTimeoutException` após o limite de leitura de 5 segundos. |
+| 5. Abertura do circuito | Após 5 tentativas falhas, o circuito passa a OPEN; não há novas chamadas externas nem retries de chamadas rejeitadas. |
+| 6. Fallback com circuito aberto | O serviço continua usando o par do PostgreSQL; sem par local, o controller responde HTTP 404. |
+| 7. Cache | Repetição reutiliza a taxa, inclusive com circuito aberto. Moedas e datas diferentes têm chaves próprias; tamanho e expiração são conferidos no Caffeine real. |
+| 8. Ausência nas duas fontes | O controller retorna HTTP 404 quando o BCB não tem dados e o banco não possui o par. |
+
+Os testes também cobrem conversão cruzada, BRL como origem, códigos em minúsculas
+e rejeição de cotações externas e locais inválidas. Os testes abaixo da Product API
+permanecem válidos e verificam a comunicação interna e seus padrões de resiliência.
+
+Foi executado ainda um teste com os dois aplicativos reais, PostgreSQL e Consul
+temporários, usando as 44 chaves do script e a API pública do BCB:
+
+| Verificação completa da atividade BCB | Resultado observado |
+| --- | --- |
+| Consulta externa real | A Currency API retornou USD/BRL 5,4686 para 04/10/2024, identificando o BCB no ambiente. |
+| Product → Consul → Currency → BCB | O produto de USD 699 foi convertido para BRL 3.822,5514 mantendo o contrato HTTP existente. |
+| Conversão cruzada real | USD/EUR retornou aproximadamente 0,9123304583 e foi consumido corretamente pela Product API. |
+| Indisponibilidade externa | Após apontar somente o Consul temporário para uma porta local sem servidor BCB, 5 tentativas abriram o circuito. O PostgreSQL forneceu USD/BRL 5,15, recebido também pela Product API. |
+| Ausência nas duas fontes | Com o circuito do BCB aberto, USD/JPY retornou HTTP 404 por não existir no banco local. |
+
+As instâncias temporárias foram encerradas ao final. O código da Product API
+permaneceu inalterado nesta atividade.
 
 | Cenário verificado | Resultado |
 | --- | --- |
@@ -134,9 +225,9 @@ valida os comandos Key/Value sem alterar o agente usado pelos serviços.
 | Mesma moeda e produto inexistente | Não há chamada remota para a mesma moeda; produto inexistente continua gerando erro. |
 | Listagem paginada | Produtos com o mesmo par reutilizam uma única cotação; preço 100 × taxa 5,15 retorna 515. |
 | Timeout HTTP | A leitura da resposta atrasada falha com `SocketTimeoutException`, capturada como `ResourceAccessException`. |
-| Currency API | Consulta existente retorna a taxa e o ambiente; aceita códigos em minúsculas, como na referência; par inexistente lança `EntityNotFoundException`. |
+| Currency API | Prioriza o BCB, calcula os pares, normaliza moedas, usa o banco em falhas e rejeita fallback local inválido. |
 
-Também foi realizada uma conferência com os dois JARs, PostgreSQL e Consul reais,
+Na atividade anterior, foi realizada uma conferência com os dois JARs, PostgreSQL e Consul reais,
 em instâncias temporárias e portas separadas: PostgreSQL 15432, Consul 18500,
 Product API 18000 e Currency API 18100. Os serviços locais existentes foram
 preservados. O Flyway criou e populou os dois bancos, o Actuator indicou saúde
@@ -156,14 +247,15 @@ O número de tentativas durante uma falha depende também das chamadas já
 registradas na janela. Se o circuit breaker abrir durante os retries, a próxima
 tentativa é rejeitada e o fallback pode indicar circuito aberto em vez de timeout.
 
-## Conferência com os serviços em execução
+## Conferência da comunicação interna com os serviços em execução
 
 O script habilita os endpoints de monitoramento nos dois serviços. Na Product API,
 consulte `/actuator/health`, `/actuator/caches`, `/actuator/circuitbreakers`,
 `/actuator/circuitbreakerevents` e `/actuator/retryevents`.
 
 1. Com ambos os serviços ativos, consulte `/products/1?targetCurrency=BRL`.
-   A cotação inicial USD/BRL é 5,15. Repita a consulta para preencher e reutilizar o cache.
+   A cotação histórica do BCB para USD/BRL é 5,4686; o fallback local vale 5,15.
+   Repita a consulta para preencher e reutilizar o cache.
 2. Interrompa a Currency API. A mesma consulta ainda usa a cotação já armazenada.
 3. Limpe o cache para testar falhas sem aguardar os 10 minutos:
 
