@@ -34,6 +34,19 @@ class CurrencyServiceJpaTest {
     }
 
     @Test
+    void shouldAcceptLowercaseCurrencyCodesAsInTheReference() throws Exception {
+        var entity = new CurrencyEntity(1L, "USD", "BRL", 5.15);
+        when(repository.findBySourceCurrencyAndTargetCurrency("USD", "BRL"))
+                .thenReturn(Optional.of(entity));
+
+        var response = service.findBySourceCurrencyAndTargetCurrency("usd", "brl");
+
+        assertEquals("USD", response.sourceCurrency());
+        assertEquals("BRL", response.targetCurrency());
+        assertEquals(5.15, response.conversionRate());
+    }
+
+    @Test
     void shouldThrowEntityNotFoundWhenPairDoesNotExist() {
         when(repository.findBySourceCurrencyAndTargetCurrency("USD", "JPY"))
                 .thenReturn(Optional.empty());

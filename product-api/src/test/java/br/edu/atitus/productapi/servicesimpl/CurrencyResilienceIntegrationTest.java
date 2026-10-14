@@ -20,6 +20,7 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.cache.caffeine.CaffeineCacheManager;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
@@ -29,6 +30,7 @@ import org.springframework.web.client.ResourceAccessException;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -66,6 +68,10 @@ class CurrencyResilienceIntegrationTest {
         runner.run(context -> {
             assertThat(context).hasNotFailed();
             assertThat(context.getBean(CacheManager.class)).isInstanceOf(CaffeineCacheManager.class);
+            var cache = (CaffeineCache) context.getBean(CacheManager.class).getCache("currency-api");
+            assertThat(cache.getNativeCache().policy().eviction().orElseThrow().getMaximum()).isEqualTo(1000);
+            assertThat(cache.getNativeCache().policy().expireAfterWrite().orElseThrow().getExpiresAfter())
+                    .isEqualTo(Duration.ofMinutes(10));
             assertThat(ProductApiApplication.class.getAnnotation(EnableCaching.class).order()).isEqualTo(99);
             var service = context.getBean(CurrencyClientService.class);
             var breaker = context.getBean(CircuitBreakerRegistry.class).circuitBreaker("currency-api");
